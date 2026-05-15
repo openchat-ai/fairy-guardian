@@ -1,0 +1,40 @@
+{
+  "name": "fairy-guardian",
+  "version": "1.1.0",
+  "description": "Self-healing cluster SDK for AI model servers — auto-restart dead instances, HTTP health checks, zero dependencies.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./guardian": "./src/guardian.js"
+  },
+  "files": [
+    "index.js",
+    "src/",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openchat-ai/openchat",
+    "directory": "modules/fairy-guardian"
+  },
+  "homepage": "https://github.com/openchat-ai/openchat/tree/main/modules/fairy-guardian",
+  "keywords": [
+    "ollama",
+    "vllm",
+    "llm",
+    "ai",
+    "model-server",
+    "self-healing",
+    "auto-restart",
+    "cluster",
+    "healthcheck",
+    "zero-dependency",
+    "guardian",
+    "daemon"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
