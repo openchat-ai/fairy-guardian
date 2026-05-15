@@ -15,10 +15,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/openchat-ai/openchat",
-    "directory": "modules/fairy-guardian"
+    "url": "git+https://github.com/openchat-ai/fairy-guardian.git"
   },
-  "homepage": "https://github.com/openchat-ai/openchat/tree/main/modules/fairy-guardian",
+  "homepage": "https://github.com/openchat-ai/fairy-guardian#readme",
   "keywords": [
     "ollama",
     "vllm",
