@@ -123,6 +123,16 @@ Record child heartbeat. Useful for active-reporting children.
 
 记录子进程心跳。
 
+### `guardian.destroy()`
+
+Clean up all state. No more operations after this.
+
+清理所有状态，之后不能再做任何操作。
+
+```js
+guardian.destroy();
+```
+
 ### `guardian.status()`
 
 Snapshot of all children · 子进程快照。

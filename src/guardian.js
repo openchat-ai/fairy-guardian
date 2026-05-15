@@ -7,7 +7,7 @@
  * Config-driven — no hardcoded ports, paths, or bridge internals.
  */
 
-import { spawn, exec } from 'child_process';
+import { spawn } from 'child_process';
 
 export class FairyGuardian {
   /**
@@ -64,6 +64,10 @@ export class FairyGuardian {
     this._reviveCount = new Map();
     this._lastRestarts = new Map();
     this._bootstrapped = false;
+    this._checking = false;
+    this._destroyed = false;
+    this._netstatCache = null;
+    this._netstatCacheTime = 0;
   }
 
   /** @returns {number} child port for index i */
@@ -86,23 +90,52 @@ export class FairyGuardian {
 
   /** Process a heartbeat from a child */
   receiveHeartbeat(port) {
+    if (this._destroyed) return;
     this._heartbeats.set(port, Date.now());
   }
 
   /** Check all children and revive dead ones */
   async checkAll() {
-    const now = Date.now();
+    if (this._destroyed || this._checking) return;
+    this._checking = true;
+    try {
+      const now = Date.now();
 
-    if (this.opts.autoBootstrap && !this._bootstrapped) {
-      this._bootstrapped = true;
-      await this._bootstrap();
-    }
+      if (this.opts.autoBootstrap && !this._bootstrapped) {
+        this._bootstrapped = true;
+        await this._bootstrap();
+      }
 
-    for (const [port, lastBeat] of this._heartbeats) {
-      if (port === this.myPort) continue;
-      if (now - lastBeat < this.opts.heartbeatTtl) continue;
-      const status = await this._checkStatus(port);
-      if (status === 'dead') await this._revive(port);
+      const stale = [];
+      for (const [port, lastBeat] of this._heartbeats) {
+        if (port === this.myPort) continue;
+        const age = now - lastBeat;
+        const rc = this._reviveCount.get(port) || 0;
+
+        // Cleanup: permanently dead (max revives exceeded + silent > 10 min)
+        if (rc >= this.opts.maxRevives && age > this.opts.reviveCooldown) {
+          stale.push(port);
+          continue;
+        }
+        // Cleanup: ghost entry (no heartbeat for 5x TTL)
+        if (age > this.opts.heartbeatTtl * 5) {
+          stale.push(port);
+          continue;
+        }
+
+        if (age < this.opts.heartbeatTtl) continue;
+        const status = await this._checkStatus(port);
+        if (status === 'dead') await this._revive(port);
+      }
+
+      for (const port of stale) {
+        this._log(`cleanup stale: ${this._childNameForPort(port) || port}`);
+        this._heartbeats.delete(port);
+        this._reviveCount.delete(port);
+        this._lastRestarts.delete(port);
+      }
+    } finally {
+      this._checking = false;
     }
   }
 
@@ -122,6 +155,7 @@ export class FairyGuardian {
 
   /** Rolling restart — one by one, wait for health before next. Zero downtime. */
   async rollingRestart() {
+    if (this._destroyed) return { ok: false, restarted: 0 };
     const ports = [...this._heartbeats.keys()];
     if (ports.length === 0) {
       this._log('no children to restart');
@@ -161,17 +195,35 @@ export class FairyGuardian {
     return { ok: true, restarted: ports.length };
   }
 
+  /** Clean up all state. No more operations after this. */
+  destroy() {
+    this._destroyed = true;
+    this._heartbeats.clear();
+    this._reviveCount.clear();
+    this._lastRestarts.clear();
+    this._netstatCache = null;
+    this._log('destroyed');
+  }
+
   // ── internals ──
 
   async _bootstrap() {
     const count = Math.min(this.opts.childCount, this.opts.childNames.length);
+    // Parallel check — any alive → skip
+    const checks = [];
     for (let i = 0; i < count; i++) {
       const port = this.childPort(i);
-      if (await this._httpPing(port).catch(() => false)) {
-        this._log(`cluster alive (${this.childName(i)} :${port}), skip bootstrap`);
-        return;
-      }
+      checks.push((async () => {
+        return await this._httpPing(port, 1500).catch(() => false);
+      })());
     }
+    const results = await Promise.all(checks);
+    if (results.some(Boolean)) {
+      const firstAlive = results.findIndex(Boolean);
+      this._log(`cluster alive (${this.childName(firstAlive)} :${this.childPort(firstAlive)}), skip bootstrap`);
+      return;
+    }
+
     for (let i = 0; i < count; i++) {
       const port = this.childPort(i);
       const name = this.childName(i);
@@ -209,10 +261,11 @@ export class FairyGuardian {
     }).unref();
   }
 
-  async _httpPing(port) {
+  async _httpPing(port, timeoutOverride) {
     try {
       const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), this.opts.pingTimeout);
+      const ms = timeoutOverride || this.opts.pingTimeout;
+      const t = setTimeout(() => ctrl.abort(), ms);
       const r = await fetch(this._healthUrl(port), { signal: ctrl.signal });
       clearTimeout(t);
       return r.ok;
@@ -220,11 +273,20 @@ export class FairyGuardian {
   }
 
   _portListening(port) {
+    const cacheTtl = 10000;
+    if (this._netstatCache && (Date.now() - this._netstatCacheTime) < cacheTtl) {
+      return this._netstatCache.includes(`:${port}`) && this._netstatCache.includes('LISTENING');
+    }
     return new Promise(r => {
       const s = spawn('netstat', ['-ano']);
       let o = '';
       s.stdout.on('data', d => o += d);
-      s.on('close', () => r(o.includes(`:${port}`) && o.includes('LISTENING')));
+      s.on('close', () => {
+        this._netstatCache = o;
+        this._netstatCacheTime = Date.now();
+        r(o.includes(`:${port}`) && o.includes('LISTENING'));
+      });
+      s.on('error', () => r(false));
     });
   }
 
@@ -238,21 +300,23 @@ export class FairyGuardian {
   _killPort(port) {
     return new Promise(r => {
       if (process.platform === 'win32') {
-        exec(`netstat -ano | findstr :${port}`, (err, stdout) => {
-          if (err || !stdout) return r();
-          const lines = stdout.trim().split('\n');
-          for (const line of lines) {
+        const netstat = spawn('netstat', ['-ano']);
+        let o = '';
+        netstat.stdout.on('data', d => o += d);
+        netstat.on('close', () => {
+          for (const line of o.split('\n')) {
+            if (!line.includes(`:${port}`) || !line.includes('LISTENING')) continue;
             const parts = line.trim().split(/\s+/);
             const pid = parts[parts.length - 1];
-            if (pid && line.includes('LISTENING')) {
-              exec(`taskkill /F /PID ${pid}`, () => r());
-              return;
-            }
+            if (!pid) continue;
+            spawn('taskkill', ['/F', '/PID', pid]).on('close', () => r());
+            return;
           }
           r();
         });
+        netstat.on('error', () => r());
       } else {
-        exec(`fuser -k ${port}/tcp 2>/dev/null`, () => r());
+        spawn('fuser', ['-k', `${port}/tcp`]).on('close', () => r());
       }
     });
   }
